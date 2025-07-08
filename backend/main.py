@@ -10,13 +10,11 @@ from pymongo import MongoClient
 from datetime import datetime
 import math
 
-# Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "http://localhost:3000"}})
 
-# Initialize MongoDB client
 mongo_uri = os.getenv('MONGODB_URI', 'mongodb://localhost:27017/')
 client = MongoClient(mongo_uri)
 db = client['video2text']
@@ -24,7 +22,6 @@ quizzes_collection = db['quizzes']
 
 transcriber = WhisperTranscribe()
 
-# Initialize QuizGenerator with API key
 api_key = os.getenv('GEMINI_API_KEY')
 if not api_key:
     raise ValueError("GEMINI_API_KEY environment variable is not set")
@@ -44,7 +41,10 @@ def convert_int_keys_to_str(obj):
 def generate_segment_quiz(transcription, segment_number, start_time, end_time):
     """Generate quiz for a specific segment of the video"""
     segment_info = f"Segment {segment_number} ({start_time}-{end_time} minutes)"
-    questions = quiz_generator.generate_quizzes_for_video(transcription, num_questions=3)
+    quiz_data = quiz_generator.generate_quiz(transcription, num_questions=3)
+    
+    if not isinstance(quiz_data, dict) or 'questions' not in quiz_data:
+        quiz_data = {"questions": []}
     
     return {
         "segment_number": segment_number,
@@ -52,7 +52,7 @@ def generate_segment_quiz(transcription, segment_number, start_time, end_time):
             "start": start_time,
             "end": end_time
         },
-        "questions": questions
+        "questions": quiz_data["questions"] 
     }
 
 @app.route("/ping", methods=["GET"])
@@ -63,13 +63,12 @@ def hello():
 def transcribe():
     url = request.json.get("url")
     try:
-        video_duration = int(request.json.get("duration", 0))  # Convert to integer
+        video_duration = int(request.json.get("duration", 0)) 
     except (ValueError, TypeError):
         return jsonify({
             "error": "Duration must be a valid number"
         }), 400
     
-    # Validate input
     if not url:
         return jsonify({
             "error": "URL is required"
@@ -80,7 +79,6 @@ def transcribe():
             "error": "Valid video duration (in minutes) is required"
         }), 400
     
-    # Check if quiz already exists
     existing_quiz = quizzes_collection.find_one({"url": url})
     if existing_quiz:
         return jsonify({
@@ -88,15 +86,27 @@ def transcribe():
             "details": "Quiz already exists for this URL"
         })
     
+    print(f"Processing video from URL: {url}")
     audio = get_audio_data(url)
-    # Convert generator to list
+    if audio is None:
+        return jsonify({
+            "error": "Failed to download or process audio from the video"
+        }), 500
+    
+    print("Audio downloaded successfully, starting transcription...")
+   
     transcriptions = list(transcriber.transcribe_audio(audio))
     
-    # Calculate number of segments (10 minutes each)
-    num_segments = max(1, math.ceil(video_duration / 10))  # Ensure at least 1 segment
+    if not transcriptions:
+        return jsonify({
+            "error": "Failed to transcribe audio"
+        }), 500
+    
+    print(f"Transcription completed successfully. Number of chunks: {len(transcriptions)}")
+    
+    num_segments = max(1, math.ceil(video_duration / 10))  
     segment_size = len(transcriptions) // num_segments
     
-    # Generate quizzes for each segment
     all_segment_quizzes = []
     for i in range(num_segments):
         start_idx = i * segment_size
@@ -108,6 +118,7 @@ def transcribe():
         start_time = i * 10
         end_time = min((i + 1) * 10, video_duration)
         
+        print(f"Generating quiz for segment {i + 1} ({start_time}-{end_time} minutes)")
         segment_quiz = generate_segment_quiz(
             segment_text,
             i + 1,
@@ -116,10 +127,8 @@ def transcribe():
         )
         all_segment_quizzes.append(segment_quiz)
     
-    # Convert integer keys to strings before storing in MongoDB
     all_segment_quizzes = convert_int_keys_to_str(all_segment_quizzes)
     
-    # Store quizzes in MongoDB
     quiz_document = {
         "url": url,
         "video_duration": video_duration,
@@ -140,11 +149,10 @@ def get_quiz():
     if not url:
         return jsonify({"error": "URL is required"}), 400
     
-    # Check if quiz exists in database
     existing_quiz = quizzes_collection.find_one({"url": url})
     
     if existing_quiz:
-        # Remove MongoDB _id field as it's not JSON serializable
+     
         existing_quiz.pop('_id', None)
         return jsonify(existing_quiz)
     
@@ -153,4 +161,9 @@ def get_quiz():
     }), 404
 
 if __name__ == "__main__":
-    app.run(debug=True, port=5000, host="0.0.0.0")
+    try:
+        app.run(debug=True, port=5000, host="0.0.0.0")
+    except KeyboardInterrupt:
+        print("\nShutting down server...")
+       
+        exit(0)
